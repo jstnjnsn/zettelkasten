@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "zettel",
+  "description": "Zettelkasten memory plugin for Claude Code",
+  "owner": {
+    "name": "Justin Jensen"
+  },
+  "plugins": [
+    {
+      "name": "zettel",
+      "description": "Zettelkasten long-term memory for Claude Code: one vault of atomic, linked markdown notes across all projects, recalled by traversal instead of bulk-loading.",
+      "author": {
+        "name": "Justin Jensen"
+      },
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}

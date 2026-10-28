@@ -1,0 +1,8 @@
+{
+  "name": "zettel",
+  "description": "Zettelkasten long-term memory for Claude Code: one vault of atomic, linked markdown notes across all projects, recalled by traversal instead of bulk-loading.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Justin Jensen"
+  }
+}

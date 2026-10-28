@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""zk — zettelkasten CLI for Claude's cross-project memory vault.
+
+Vault layout:
+  ~/.claude/zettel/notes/<project>/<slug>.md   one atomic note per file
+  Slugs are unique vault-wide; links are [[slug]].
+
+Commands:
+  zk init                   create an empty vault (with a generic global hub) if none exists
+  zk search <terms...>      ranked search; returns slug + description lines only
+  zk show <slug>            print one note + one-line stubs of its links/backlinks
+  zk backlinks <slug>       notes that link TO <slug>
+  zk register <project>     emit the register card for a project's MEMORY.md bridge
+  zk new <slug> --project P --type T --title ... --desc ... [--tags a,b]
+  zk check                  vault hygiene: dangling links, dup slugs, missing descriptions
+  zk list [project]         all slugs (optionally for one project)
+"""
+import argparse
+import datetime
+import math
+import os
+import re
+import sys
+
+def _resolve_vault():
+    """Vault location: $ZK_VAULT if set, else ~/.claude/zettel.
+
+    The directory containing bin/zk is deliberately never a candidate: under a
+    plugin install that is the plugin cache, which is replaced on every update.
+    """
+    env = os.environ.get("ZK_VAULT")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.expanduser("~/.claude/zettel")
+
+
+VAULT = _resolve_vault()
+NOTES = os.path.join(VAULT, "notes")
+LINK_RE = re.compile(r"\[\[([A-Za-z0-9_\-./]+)\]\]")
+TYPES = ("decision", "feedback", "map", "reference", "user", "hub", "project")
+
+GLOBAL_HUB = """---
+title: Global hub — cross-project knowledge
+description: entry hub for knowledge that applies across every project (working rules, preferences, tooling)
+type: hub
+project: global
+tags: [entry-point]
+created: {created}
+---
+
+Cross-project knowledge. Every project's register links here.
+
+## Working rules
+Nothing yet. As rules are learned, write each as its own feedback note and link it from this section.
+
+## Promotion rule
+When a note in a project folder proves useful in a second project, move it here: rewrite `project:` to global and relocate the file. The slug stays the same, so links survive. Then link it from both projects' hubs.
+"""
+
+
+def iter_note_paths():
+    for root, _dirs, files in os.walk(NOTES):
+        for f in sorted(files):
+            if f.endswith(".md"):
+                yield os.path.join(root, f)
+
+
+def parse_note(path):
+    slug = os.path.splitext(os.path.basename(path))[0]
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    fm, body = {}, text
+    if text.startswith("---"):
+        parts = text.split("\n---", 2)
+        if len(parts) >= 2:
+            for line in parts[0].splitlines()[1:]:
+                if ":" in line and not line.startswith((" ", "\t", "#")):
+                    k, _, v = line.partition(":")
+                    fm[k.strip()] = v.strip()
+            body = parts[1].lstrip("-").lstrip("\n") if len(parts) == 2 else parts[1]
+    tags = fm.get("tags", "")
+    fm["tags_list"] = [t.strip() for t in tags.strip("[]").split(",") if t.strip()]
+    # ignore [[..]] inside code spans / fenced blocks (quoted examples, not links)
+    linkable = re.sub(r"```.*?```", "", body, flags=re.S)
+    linkable = re.sub(r"`[^`\n]*`", "", linkable)
+    return {"slug": slug, "path": path, "fm": fm, "body": body,
+            "links": LINK_RE.findall(linkable),
+            "project": fm.get("project", os.path.basename(os.path.dirname(path)))}
+
+
+def load_all():
+    notes = {}
+    dupes = []
+    for p in iter_note_paths():
+        n = parse_note(p)
+        if n["slug"] in notes:
+            dupes.append((n["slug"], p, notes[n["slug"]]["path"]))
+        notes[n["slug"]] = n
+    return notes, dupes
+
+
+def stub(n):
+    desc = n["fm"].get("description", "(no description)")
+    return f'{n["slug"]} — {desc}  [{n["fm"].get("type", "?")}/{n["project"]}]'
+
+
+STOPWORDS = frozenset("""a an and are as at be been but by can did do does for from get got has have
+how i if in into is it its me my need of on or our should so that the their them then there these
+they this to up us via was we what when where which who why will with would you your""".split())
+
+
+def cmd_search(args):
+    """Rank by IDF-weighted, length-normalised, saturating term hits.
+
+    Plain term counts rank the longest note first for any query containing common
+    words: 'how do we handle the timeout' scored notes on 'the'/'handle'/'do'
+    and buried the one note that is actually about timeouts. So: drop stopwords, weight
+    each term by how RARE it is vault-wide, damp long notes, and saturate repeats —
+    a note that says a word forty times is not forty times more relevant than the
+    note that is about it.
+    """
+    notes, _ = load_all()
+    raw = [t.lower() for t in args.terms]
+    terms = [t for t in raw if t not in STOPWORDS] or raw
+    docs = list(notes.values())
+    fields = {}
+    for n in docs:
+        head = " ".join([n["slug"], n["fm"].get("title", ""), n["fm"].get("description", ""),
+                         " ".join(n["fm"]["tags_list"])]).lower()
+        fields[n["slug"]] = (head, n["body"].lower())
+    total = len(docs) or 1
+    avg_len = sum(len(b) for _, b in fields.values()) / total or 1
+    df = {t: sum(1 for h, b in fields.values() if t in h or t in b) or 1 for t in terms}
+
+    scored = []
+    for n in docs:
+        head, body = fields[n["slug"]]
+        norm = math.sqrt(avg_len / max(len(body), 1))
+        score, hits = 0.0, 0
+        for t in terms:
+            h, b = head.count(t), body.count(t)
+            if h or b:
+                hits += 1
+            tf = h * 5 + b * norm
+            if tf:
+                idf = math.log(1 + (total - df[t] + 0.5) / (df[t] + 0.5))
+                score += idf * (tf / (tf + 1.5))
+        if hits == len(terms):
+            score *= 1.5
+        if score > 0:
+            scored.append((score, n))
+    scored.sort(key=lambda s: (-s[0], s[1]["slug"]))
+    if not scored:
+        print("no matches")
+        return
+    for _score, n in scored[: args.limit]:
+        print(stub(n))
+    if len(scored) > args.limit:
+        print(f"... {len(scored) - args.limit} more (raise --limit or refine terms)")
+
+
+def cmd_show(args):
+    notes, _ = load_all()
+    n = notes.get(args.slug)
+    if not n:
+        near = [s for s in notes if args.slug.lower() in s.lower()]
+        print(f"not found: {args.slug}")
+        if near:
+            print("did you mean: " + ", ".join(sorted(near)[:8]))
+        sys.exit(1)
+    print(f"# {n['path']}")
+    print(n["body"] if args.body_only else open(n["path"], encoding="utf-8").read())
+    outlinks = [l for l in dict.fromkeys(n["links"])]
+    if outlinks:
+        print("\n== links ==")
+        for l in outlinks:
+            print("  → " + (stub(notes[l]) if l in notes else f"{l} — ⚠ MISSING NOTE"))
+    back = [m for m in notes.values() if n["slug"] in m["links"]]
+    if back:
+        print("== backlinks ==")
+        for m in back:
+            print("  ← " + stub(m))
+
+
+def cmd_backlinks(args):
+    notes, _ = load_all()
+    for m in notes.values():
+        if args.slug in m["links"]:
+            print(stub(m))
+
+
+def cmd_list(args):
+    notes, _ = load_all()
+    for n in sorted(notes.values(), key=lambda x: (x["project"], x["slug"])):
+        if not args.project or n["project"] == args.project:
+            print(stub(n))
+
+
+def cmd_register(args):
+    notes, _ = load_all()
+    hubs = [n for n in notes.values()
+            if n["fm"].get("type") == "hub" and n["project"] in (args.project, "global")]
+    hubs.sort(key=lambda n: (n["project"] != args.project, n["slug"]))
+    print(f"# Zettelkasten register — {args.project}")
+    print()
+    print(f"All memory lives in the user-scoped zettelkasten vault (`{VAULT}`); the `zettel` skill knows the CLI.")
+    print("Do NOT append memories to this file and do NOT write new files in this directory —")
+    print("write notes into the vault instead (see the `zettel` skill). This register is")
+    print(f"generated: `zk register {args.project}` > MEMORY.md")
+    print()
+    print("Entry hubs (traverse, don't bulk-load):")
+    for h in hubs:
+        marker = "  READ FIRST each session" if "invariant" in h["slug"] else ""
+        print(f"- `zk show {h['slug']}` — {h['fm'].get('description', '')}{marker}")
+    print()
+    print('Recall protocol: `zk search "<terms>"` → `zk show <slug>` → follow links 2–4 hops.')
+    print("Never load the whole vault or a whole project folder into context.")
+
+
+def cmd_new(args):
+    if args.type not in TYPES:
+        sys.exit(f"type must be one of {TYPES}")
+    d = os.path.join(NOTES, args.project)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, args.slug + ".md")
+    if os.path.exists(path):
+        sys.exit(f"exists: {path}")
+    notes, _ = load_all()
+    if args.slug in notes:
+        sys.exit(f"slug taken by {notes[args.slug]['path']}")
+    tags = ", ".join(t.strip() for t in (args.tags or "").split(",") if t.strip())
+    fm = [
+        "---",
+        f"title: {args.title}",
+        f"description: {args.desc}",
+        f"type: {args.type}",
+        f"project: {args.project}",
+        f"tags: [{tags}]",
+        f"created: {datetime.date.today().isoformat()}",
+    ]
+    if args.verified:
+        fm.append(f"verified: {args.verified}")
+    fm.append("---")
+    body = args.body if args.body else "(body here — atomic: one idea, link related notes with [[slug]])"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(fm) + "\n\n" + body + "\n")
+    print(path)
+
+
+def cmd_init(_args):
+    if os.path.isdir(NOTES):
+        print(f"vault already exists at {VAULT}")
+        return
+    hub = os.path.join(NOTES, "global", "global.md")
+    os.makedirs(os.path.dirname(hub))
+    with open(hub, "w", encoding="utf-8") as fh:
+        fh.write(GLOBAL_HUB.format(created=datetime.date.today().isoformat()))
+    print(f"created vault at {VAULT}\n  hub: {hub}")
+
+
+def cmd_check(_args):
+    notes, dupes = load_all()
+    problems = 0
+    for slug, p1, p2 in dupes:
+        print(f"DUP SLUG: {slug}: {p1} vs {p2}")
+        problems += 1
+    for n in notes.values():
+        for l in n["links"]:
+            if l not in notes:
+                print(f"DANGLING: [[{l}]] in {n['slug']}")
+                problems += 1
+        if not n["fm"].get("description"):
+            print(f"NO DESCRIPTION: {n['slug']}")
+            problems += 1
+        if n["fm"].get("type") not in TYPES:
+            print(f"BAD TYPE ({n['fm'].get('type')}): {n['slug']}")
+            problems += 1
+    linked = {l for n in notes.values() for l in n["links"]}
+    orphans = [n for n in notes.values()
+               if n["slug"] not in linked and n["fm"].get("type") != "hub"]
+    for n in orphans:
+        print(f"ORPHAN (no backlinks — link it from a hub or note): {n['slug']}")
+    print(f"\n{len(notes)} notes, {problems} problems, {len(orphans)} orphans")
+    sys.exit(1 if problems else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zk")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("search"); s.add_argument("terms", nargs="+"); s.add_argument("--limit", type=int, default=15); s.set_defaults(f=cmd_search)
+    s = sub.add_parser("show"); s.add_argument("slug"); s.add_argument("--body-only", action="store_true"); s.set_defaults(f=cmd_show)
+    s = sub.add_parser("backlinks"); s.add_argument("slug"); s.set_defaults(f=cmd_backlinks)
+    s = sub.add_parser("list"); s.add_argument("project", nargs="?"); s.set_defaults(f=cmd_list)
+    s = sub.add_parser("register"); s.add_argument("project"); s.set_defaults(f=cmd_register)
+    s = sub.add_parser("new")
+    s.add_argument("slug"); s.add_argument("--project", required=True); s.add_argument("--type", required=True)
+    s.add_argument("--title", required=True); s.add_argument("--desc", required=True)
+    s.add_argument("--tags"); s.add_argument("--verified"); s.add_argument("--body")
+    s.set_defaults(f=cmd_new)
+    s = sub.add_parser("check"); s.set_defaults(f=cmd_check)
+    s = sub.add_parser("init"); s.set_defaults(f=cmd_init)
+    args = ap.parse_args()
+    if args.cmd != "init" and not os.path.isdir(NOTES):
+        sys.exit(f"zk: no vault at {VAULT} (looked for {NOTES}).\n"
+                 f"    Run `zk init` to create it, or set ZK_VAULT to the vault directory.")
+    args.f(args)
+
+
+if __name__ == "__main__":
+    main()

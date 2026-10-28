@@ -1,0 +1,9 @@
+# Starter questions for the example vault. One row per question, tab-separated:
+# id, project, query, target_slug, answer_regex
+# Phrase queries the way a session would really ask, not with the slug's own words.
+force_push	global	can i rewrite the branch history and push	feedback_ask_before_force_push	explicit permission
+chat_len	global	how much should i write back in chat	feedback_short_answers_in_chat	one line each
+money	shopcart	why is money an integer instead of a float	decision_shopcart_prices_in_cents_2026_01_06	integer cents
+retry	shopcart	what happens if the payment call is retried	map_shopcart_checkout	returns the first result
+staging	shopcart	where do i test the site before release	reference_shopcart_staging_url	staging\.shopcart\.example
+sql	shopcart	can a controller run a query directly	shopcart-invariants	never issue raw SQL

@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""zk_bench — measure what a recall actually costs, three ways.
+
+The claim under test: traversal retrieval (register -> search -> show) puts less
+text in context than a flat memory file, WITHOUT losing the answer.
+
+Arms, per question:
+  flat   the pre-vault shape — the whole project memory file is in context
+  grep   a competent flat-file baseline — grep the file, keep matching lines + context
+  zk     the vault — register card + `zk search` output + `zk show` on each hit walked
+
+What is measured (not estimated): BYTES of text retrieved, wall-clock ms, hops,
+and whether the answer string is actually present in what came back. Bytes are the
+ground truth here; a token column appears only if you pass --bytes-per-token, and
+it is labelled derived, because an unmeasured token count is a guess.
+
+  zk_bench [--questions FILE] [--arms flat,grep,zk] [--json] [--bytes-per-token N]
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+VAULT = os.path.abspath(os.path.expanduser(os.environ.get("ZK_VAULT") or "~/.claude/zettel"))
+NOTES = os.path.join(VAULT, "notes")
+ZK = os.path.join(HERE, "zk")
+GREP_CONTEXT = 4
+MAX_HOPS = 3
+
+
+def load_questions(path):
+    qs = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) != 5:
+                sys.exit(f"bad question row (want 5 tab-separated fields): {line!r}")
+            qs.append(dict(zip(("id", "project", "query", "target", "regex"), parts)))
+    return qs
+
+
+def corpus(project):
+    """The flat memory file this project WOULD have: its notes + global, concatenated."""
+    chunks = []
+    for proj in (project, "global"):
+        d = os.path.join(NOTES, proj)
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".md"):
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    chunks.append(fh.read())
+    return "\n\n".join(chunks)
+
+
+def run_zk(*argv):
+    t0 = time.perf_counter()
+    out = subprocess.run([sys.executable, ZK, *argv], capture_output=True, text=True)
+    return out.stdout, (time.perf_counter() - t0) * 1000
+
+
+def arm_flat(q, text):
+    t0 = time.perf_counter()
+    ms = (time.perf_counter() - t0) * 1000
+    return {"retrieved": text, "hops": 1, "ms": ms, "rank": None}
+
+
+def arm_grep(q, text):
+    """Generous flat-file baseline: any line containing ANY query term, plus context."""
+    t0 = time.perf_counter()
+    terms = [t.lower() for t in q["query"].split()]
+    lines = text.splitlines()
+    keep = set()
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if any(t in low for t in terms):
+            keep.update(range(max(0, i - GREP_CONTEXT), min(len(lines), i + GREP_CONTEXT + 1)))
+    out = "\n".join(lines[i] for i in sorted(keep))
+    return {"retrieved": out, "hops": 1, "ms": (time.perf_counter() - t0) * 1000, "rank": None}
+
+
+def arm_zk(q, _text):
+    """Traversal: register card, then search, then show hits in rank order until answered."""
+    reg, ms = run_zk("register", q["project"])
+    search, ms2 = run_zk("search", *q["query"].split())
+    ms += ms2
+    retrieved = reg + search
+    hits = [ln.split(" — ")[0].strip() for ln in search.splitlines()
+            if ln.strip() and not ln.startswith(("...", "no matches"))]
+    rank = hits.index(q["target"]) + 1 if q["target"] in hits else None
+    hops = 0
+    rx = re.compile(q["regex"])
+    for slug in hits[:MAX_HOPS]:
+        hops += 1
+        body, ms3 = run_zk("show", slug)
+        ms += ms3
+        retrieved += body
+        if rx.search(retrieved):
+            break
+    return {"retrieved": retrieved, "hops": hops, "ms": ms, "rank": rank}
+
+
+ARMS = {"flat": arm_flat, "grep": arm_grep, "zk": arm_zk}
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zk_bench")
+    ap.add_argument("--questions", default=os.path.join(VAULT, "bench", "questions.tsv"))
+    ap.add_argument("--arms", default="flat,grep,zk")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--bytes-per-token", type=float, default=None,
+                    help="derive a token column from measured bytes; DERIVED, not measured")
+    args = ap.parse_args()
+
+    qs = load_questions(args.questions)
+    arms = [a for a in args.arms.split(",") if a in ARMS]
+    text_cache, rows = {}, []
+
+    for q in qs:
+        if q["project"] not in text_cache:
+            text_cache[q["project"]] = corpus(q["project"])
+        text = text_cache[q["project"]]
+        rx = re.compile(q["regex"])
+        row = {"id": q["id"], "target": q["target"], "arms": {}}
+        for a in arms:
+            r = ARMS[a](q, text)
+            row["arms"][a] = {"bytes": len(r["retrieved"]), "hit": bool(rx.search(r["retrieved"])),
+                              "hops": r["hops"], "ms": round(r["ms"], 1), "rank": r["rank"]}
+        rows.append(row)
+
+    if args.json:
+        print(json.dumps({"vault": VAULT, "questions": len(qs), "rows": rows}, indent=2))
+        return
+
+    w = max(len(r["id"]) for r in rows) + 1
+    head = f"{'question':<{w}}" + "".join(f"{a + ' bytes':>14}{'':>4}" for a in arms)
+    print(head)
+    print("-" * len(head))
+    for r in rows:
+        line = f"{r['id']:<{w}}"
+        for a in arms:
+            c = r["arms"][a]
+            line += f"{c['bytes']:>14,}{'  ✓' if c['hit'] else '  ✗':>4}"
+        print(line)
+    print("-" * len(head))
+
+    def agg(a, key):
+        return [r["arms"][a][key] for r in rows]
+
+    print(f"\n{len(rows)} questions · vault {VAULT}")
+    for a in arms:
+        b = agg(a, "bytes")
+        hits = sum(1 for h in agg(a, "hit") if h)
+        med = sorted(b)[len(b) // 2]
+        print(f"  {a:<5} median {med:>9,} bytes · total {sum(b):>10,} · "
+              f"answer found {hits}/{len(rows)} · median {sorted(agg(a, 'ms'))[len(b) // 2]:>6.1f} ms"
+              + (f" · median {sorted(agg(a, 'hops'))[len(b) // 2]} hops" if a == "zk" else ""))
+    if "flat" in arms and "zk" in arms:
+        f, z = sum(agg("flat", "bytes")), sum(agg("zk", "bytes"))
+        print(f"\n  zk retrieves {f / z:.1f}x less text than flat across the set "
+              f"({f:,} -> {z:,} bytes).")
+    if args.bytes_per_token:
+        print(f"\n  DERIVED token estimate at {args.bytes_per_token} bytes/token "
+              f"(NOT measured — no tokenizer available; replace with a real count before "
+              f"quoting this as evidence):")
+        for a in arms:
+            print(f"    {a:<5} {sum(agg(a, 'bytes')) / args.bytes_per_token:>12,.0f} tokens total")
+    missed = [(r["id"], a) for r in rows for a in arms if not r["arms"][a]["hit"]]
+    if missed:
+        print("\n  misses (arm failed to retrieve the answer):")
+        for qid, a in missed:
+            print(f"    {qid} · {a}")
+    unranked = [r["id"] for r in rows if "zk" in arms and r["arms"]["zk"]["rank"] is None]
+    if unranked:
+        print(f"\n  target note not in zk search results (ranking gap): {', '.join(unranked)}")
+
+
+if __name__ == "__main__":
+    main()
