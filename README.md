@@ -13,7 +13,7 @@ never live in the plugin.
 In Claude Code:
 
 ```
-/plugin marketplace add <git url of this repo>
+/plugin marketplace add https://github.com/jstnjnsn/zettelkasten.git
 /plugin install zettel@zettel
 ```
 
